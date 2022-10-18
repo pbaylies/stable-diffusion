@@ -2,6 +2,7 @@
 import k_diffusion as K
 import torch
 import torch.nn as nn
+import torchvision.transforms.functional as TF
 from ldm.invoke.devices import choose_torch_device
 from ldm.models.diffusion.sampler import Sampler
 from ldm.util import rand_perlin_2d
@@ -20,9 +21,12 @@ def cfg_apply_threshold(result, threshold = 0.0, scale = 0.7):
     if maxval < threshold and minval > -threshold:
         return result
     if maxval > threshold:
+        # stochastic clipping - replace with a random value in the proper range - see https://arxiv.org/pdf/1702.04782.pdf
         maxval = min(max(1, scale*maxval), threshold)
+        result[result > maxval] = torch.rand_like(result[result > maxval]) * maxval
     if minval < -threshold:
         minval = max(min(-1, scale*minval), -threshold)
+        result[result < minval] = torch.rand_like(result[result < minval]) * minval
     return torch.clamp(result, min=minval, max=maxval)
 
 
@@ -33,6 +37,15 @@ class CFGDenoiser(nn.Module):
         self.threshold = threshold
         self.warmup_max = warmup
         self.warmup = max(warmup / 10, 1)
+        self.device = choose_torch_device()
+
+        # Original values from @hotgrits - EleutherAI #art Discord
+        #self.bias = torch.tensor([0.643514,9.25987,9.2601,30.0],device=self.device).reshape(1,4,1,1)
+        #self.scale = torch.tensor([0.329352,0.0499579,0.0437116,0.0142739],device=self.device).reshape(1,4,1,1)
+
+        # values scaled up
+        self.bias = torch.tensor([0.211942622928,3.04975670424,3.0498324552,9.88056],device=self.device).reshape(1,4,1,1)
+        self.scale = torch.tensor([1.0,0.15168543078529961864,0.13272000777283878646,0.04333934513833224027],device=self.device).reshape(1,4,1,1)
 
     def forward(self, x, sigma, uncond, cond, cond_scale):
         x_in = torch.cat([x] * 2)
@@ -46,7 +59,11 @@ class CFGDenoiser(nn.Module):
             thresh = self.threshold
         if thresh > self.threshold:
             thresh = self.threshold
-        return cfg_apply_threshold(uncond + (cond - uncond) * cond_scale, thresh)
+        step = uncond + (cond - uncond) * cond_scale
+        step = (step + self.bias) * self.scale
+        step = cfg_apply_threshold(step, thresh)
+        step = (step / self.scale) - self.bias
+        return step
 
 
 class KSampler(Sampler):
